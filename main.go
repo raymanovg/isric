@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -40,20 +42,35 @@ func main() {
 		log.Fatal(err)
 	}
 
+	done := make(chan struct{})
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	go run(done)
+	<-signalCh
+	close(done)
+}
+
+func run(done chan struct{}) {
 	wg := sync.WaitGroup{}
 	for _, pageParam := range config.Pages {
-		wg.Add(1)
-		go func(pageParam PageParam) {
-			if err := handle(pageParam); err != nil {
-				fmt.Printf("handling %s failed: %v \n", pageParam.Name, err)
-			}
-			wg.Done()
-		}(pageParam)
+		select {
+		case <-done:
+			return
+		default:
+			wg.Add(1)
+			go func(pageParam PageParam) {
+				if err := handle(pageParam, done); err != nil {
+					fmt.Printf("handling %s failed: %v \n", pageParam.Name, err)
+				}
+				wg.Done()
+			}(pageParam)
+		}
 	}
 	wg.Wait()
 }
 
-func handle(params PageParam) error {
+func handle(params PageParam, done <-chan struct{}) error {
 	parsedUrl, _ := url.Parse(params.Url)
 	baseURL := *parsedUrl
 	html, err := getHTML(baseURL)
@@ -61,51 +78,66 @@ func handle(params PageParam) error {
 		return fmt.Errorf("error to get html page: %v", err)
 	}
 
-	for u := range parseURLs(baseURL, html, params.PageRanges) {
-		html, err := getHTML(u)
-		if err != nil {
-			log.Printf("error to get html page %s: %v \n", u.String(), err)
-			continue
-		}
-		for fileUrl := range getTifUrls(u, html) {
-			if _, err := download(fileUrl); err != nil {
-				log.Printf("unable to download file %s: %v", fileUrl.String(), err)
+	for u := range parseURLs(baseURL, html, params.PageRanges, done) {
+		select {
+		case <-done:
+			return nil
+		default:
+			html, err := getHTML(u)
+			if err != nil {
+				log.Printf("error to get html page %s: %v \n", u.String(), err)
+				continue
+			}
+			for fileUrl := range getTifUrls(u, html, done) {
+				if _, err := download(fileUrl); err != nil {
+					log.Printf("unable to download file %s: %v", fileUrl.String(), err)
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func getTifUrls(pageURL url.URL, page []byte) <-chan url.URL {
+func getTifUrls(pageURL url.URL, page []byte, done <-chan struct{}) <-chan url.URL {
 	urlChan := make(chan url.URL)
 	go func() {
+		defer close(urlChan)
 		re := regexp.MustCompile("href=\"(.*\\.tif)\"")
 		matches := re.FindAllStringSubmatch(string(page), -1)
 		for _, m := range matches {
-			tifURL := pageURL
-			tifURL.Path = path.Join(pageURL.Path, m[1])
-			urlChan <- tifURL
+			select {
+			case <-done:
+				return
+			default:
+				tifURL := pageURL
+				tifURL.Path = path.Join(pageURL.Path, m[1])
+				urlChan <- tifURL
+			}
 		}
-		close(urlChan)
 	}()
 	return urlChan
 }
 
-func parseURLs(pageURL url.URL, pageBody []byte, pageRanges []string) <-chan url.URL {
+func parseURLs(pageURL url.URL, pageBody []byte, pageRanges []string, done <-chan struct{}) <-chan url.URL {
 	urlChan := make(chan url.URL)
 	stringPageBody := string(pageBody)
 	go func() {
+		defer close(urlChan)
 		for _, tpl := range buildLinkTemplates(pageRanges) {
 			regxStr := fmt.Sprintf("href=\"(%s)\\/\"", tpl)
 			re := regexp.MustCompile(regxStr)
 			matches := re.FindAllStringSubmatch(stringPageBody, -1)
 			for _, m := range matches {
-				link := pageURL
-				link.Path = path.Join(pageURL.Path, m[1]) + "/"
-				urlChan <- link
+				select {
+				case <-done:
+					return
+				default:
+					link := pageURL
+					link.Path = path.Join(pageURL.Path, m[1]) + "/"
+					urlChan <- link
+				}
 			}
 		}
-		close(urlChan)
 	}()
 	return urlChan
 }
