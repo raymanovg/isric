@@ -42,35 +42,42 @@ func main() {
 		log.Fatal(err)
 	}
 
-	done := make(chan struct{})
+	terminate := make(chan struct{})
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	go run(done)
-	<-signalCh
-	close(done)
+	done := make(chan struct{})
+	go func() {
+		run(terminate)
+		close(done)
+	}()
+
+	select {
+	case <-signalCh:
+		fmt.Println("Terminating")
+		close(terminate)
+		time.Sleep(time.Second * 5)
+		break
+	case <-done:
+		fmt.Println("Done")
+	}
 }
 
-func run(done chan struct{}) {
+func run(terminate chan struct{}) {
 	wg := sync.WaitGroup{}
 	for _, pageParam := range config.Pages {
-		select {
-		case <-done:
-			return
-		default:
-			wg.Add(1)
-			go func(pageParam PageParam) {
-				if err := handle(pageParam, done); err != nil {
-					fmt.Printf("handling %s failed: %v \n", pageParam.Name, err)
-				}
-				wg.Done()
-			}(pageParam)
-		}
+		wg.Add(1)
+		go func(pageParam PageParam) {
+			if err := handle(pageParam, terminate); err != nil {
+				fmt.Printf("handling %s failed: %v \n", pageParam.Name, err)
+			}
+			wg.Done()
+		}(pageParam)
 	}
 	wg.Wait()
 }
 
-func handle(params PageParam, done <-chan struct{}) error {
+func handle(params PageParam, terminate <-chan struct{}) error {
 	parsedUrl, _ := url.Parse(params.Url)
 	baseURL := *parsedUrl
 	html, err := getHTML(baseURL)
@@ -78,68 +85,67 @@ func handle(params PageParam, done <-chan struct{}) error {
 		return fmt.Errorf("error to get html page: %v", err)
 	}
 
-	for u := range parseURLs(baseURL, html, params.PageRanges, done) {
+	for pageUrl := range parseURLs(baseURL, html, params.PageRanges) {
 		select {
-		case <-done:
+		case <-terminate:
+			fmt.Println("handle is terminated")
 			return nil
 		default:
-			html, err := getHTML(u)
-			if err != nil {
-				log.Printf("error to get html page %s: %v \n", u.String(), err)
-				continue
+		}
+
+		html, err := getHTML(pageUrl)
+		if err != nil {
+			log.Printf("error to get html page %s: %v \n", pageUrl.String(), err)
+			continue
+		}
+		for fileUrl := range getTifUrls(pageUrl, html) {
+			select {
+			case <-terminate:
+				fmt.Println("downloading is terminated")
+				return nil
+			default:
 			}
-			for fileUrl := range getTifUrls(u, html, done) {
-				if _, err := download(fileUrl); err != nil {
-					log.Printf("unable to download file %s: %v", fileUrl.String(), err)
-				}
+			if _, err := download(fileUrl); err != nil {
+				log.Printf("unable to download file %s: %v", fileUrl.String(), err)
 			}
 		}
 	}
+
 	return nil
 }
 
-func getTifUrls(pageURL url.URL, page []byte, done <-chan struct{}) <-chan url.URL {
+func getTifUrls(pageURL url.URL, page []byte) chan url.URL {
 	urlChan := make(chan url.URL)
 	go func() {
-		defer close(urlChan)
 		re := regexp.MustCompile("href=\"(.*\\.tif)\"")
 		matches := re.FindAllStringSubmatch(string(page), -1)
 		for _, m := range matches {
-			select {
-			case <-done:
-				return
-			default:
-				tifURL := pageURL
-				tifURL.Path = path.Join(pageURL.Path, m[1])
-				urlChan <- tifURL
-			}
+			tifURL := pageURL
+			tifURL.Path = path.Join(pageURL.Path, m[1])
+			urlChan <- tifURL
 		}
 	}()
+
 	return urlChan
 }
 
-func parseURLs(pageURL url.URL, pageBody []byte, pageRanges []string, done <-chan struct{}) <-chan url.URL {
-	urlChan := make(chan url.URL)
+func parseURLs(pageURL url.URL, pageBody []byte, pageRanges []string) chan url.URL {
+	urlsCh := make(chan url.URL)
 	stringPageBody := string(pageBody)
 	go func() {
-		defer close(urlChan)
 		for _, tpl := range buildLinkTemplates(pageRanges) {
 			regxStr := fmt.Sprintf("href=\"(%s)\\/\"", tpl)
 			re := regexp.MustCompile(regxStr)
 			matches := re.FindAllStringSubmatch(stringPageBody, -1)
 			for _, m := range matches {
-				select {
-				case <-done:
-					return
-				default:
-					link := pageURL
-					link.Path = path.Join(pageURL.Path, m[1]) + "/"
-					urlChan <- link
-				}
+				link := pageURL
+				link.Path = path.Join(pageURL.Path, m[1]) + "/"
+				urlsCh <- link
 			}
 		}
 	}()
-	return urlChan
+
+	return urlsCh
 }
 
 func getHTML(url url.URL) ([]byte, error) {
