@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -19,6 +20,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	FileExistError = errors.New("File exist")
+)
+
 type PageParam struct {
 	Name       string   `yaml:"name"`
 	Url        string   `yaml:"url"`
@@ -28,6 +33,11 @@ type PageParam struct {
 type Config struct {
 	TargetDir string      `yaml:"targetDir"`
 	Pages     []PageParam `yaml:"pages"`
+}
+
+type FileName struct {
+	Dir string
+	Name string
 }
 
 var config = Config{}
@@ -99,6 +109,7 @@ func handle(params PageParam, terminate <-chan struct{}) error {
 			continue
 		}
 		for fileUrl := range getTifUrls(pageUrl, html) {
+			fmt.Println(fileUrl)
 			select {
 			case <-terminate:
 				fmt.Println("downloading is terminated")
@@ -121,28 +132,33 @@ func getTifUrls(pageURL url.URL, page []byte) chan url.URL {
 		matches := re.FindAllStringSubmatch(string(page), -1)
 		for _, m := range matches {
 			tifURL := pageURL
-			tifURL.Path = path.Join(pageURL.Path, m[1])
+			tifURL.Path = m[1]
 			urlChan <- tifURL
 		}
+		close(urlChan)
 	}()
 
 	return urlChan
 }
 
 func parseURLs(pageURL url.URL, pageBody []byte, pageRanges []string) chan url.URL {
+	fmt.Println(pageURL.String())
 	urlsCh := make(chan url.URL)
 	stringPageBody := string(pageBody)
 	go func() {
 		for _, tpl := range buildLinkTemplates(pageRanges) {
-			regxStr := fmt.Sprintf("href=\"(%s)\\/\"", tpl)
+			regxStr := fmt.Sprintf("href=\".*(%s)\\/\"", tpl)
+			fmt.Println(regxStr)
 			re := regexp.MustCompile(regxStr)
 			matches := re.FindAllStringSubmatch(stringPageBody, -1)
+
 			for _, m := range matches {
 				link := pageURL
 				link.Path = path.Join(pageURL.Path, m[1]) + "/"
 				urlsCh <- link
 			}
 		}
+		close(urlsCh)
 	}()
 
 	return urlsCh
@@ -158,6 +174,11 @@ func getHTML(url url.URL) ([]byte, error) {
 }
 
 func download(url url.URL) (int64, error) {
+	fileName := getFileName(url.Path)
+	if _, err := os.Stat(fileName.Name); !os.IsNotExist(err) {
+		return 0, FileExistError
+	}
+
 	fmt.Printf("Downlading %s \n", url.String())
 	response, err := request(url)
 	if err != nil {
@@ -165,7 +186,7 @@ func download(url url.URL) (int64, error) {
 	}
 	defer response.Body.Close()
 
-	file, err := createFile(url.Path)
+	file, err := createFile(fileName)
 	if err != nil {
 		return 0, fmt.Errorf("unable to downoad file: %v", err)
 	}
@@ -174,15 +195,14 @@ func download(url url.URL) (int64, error) {
 	return io.Copy(file, response.Body)
 }
 
-func createFile(urlPath string) (*os.File, error) {
-	parts := strings.Split(urlPath, "/")
-	dir := path.Join(config.TargetDir, strings.Join(parts[len(parts)-3:len(parts)-1], "/"))
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err = os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("unable to create dir %s: %v", dir, err)
+func createFile(fileName FileName) (*os.File, error) {
+	if _, err := os.Stat(fileName.Dir); os.IsNotExist(err) {
+		if err = os.MkdirAll(fileName.Dir, 0755); err != nil {
+			return nil, fmt.Errorf("unable to create dir %s: %v", fileName.Dir, err)
 		}
 	}
-	return os.Create(path.Join(dir, parts[len(parts)-1]))
+
+	return os.Create(fileName.Name)
 }
 
 func buildLinkTemplates(ranges []string) []string {
@@ -203,7 +223,7 @@ func buildLinkTemplates(ranges []string) []string {
 
 func request(url url.URL) (*http.Response, error) {
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 1000 * time.Second,
 	}
 	request, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
@@ -212,5 +232,14 @@ func request(url url.URL) (*http.Response, error) {
 	request.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.54 Safari/537.36")
 	request.Header.Set("accept-language", "en-GB,en-US;q=0.9,en;q=0.8,ru;q=0.7,kk;q=0.6")
 	request.Header.Set("accept-encoding", "gzip, deflate, br")
+
 	return client.Do(request)
+}
+
+func getFileName(urlPath string) FileName {
+	parts := strings.Split(urlPath, "/")
+	dir := path.Join(config.TargetDir, strings.Join(parts[len(parts)-3:len(parts)-1], "/"))
+	fileName := path.Join(dir, parts[len(parts)-1])
+
+	return FileName{dir, fileName}
 }
